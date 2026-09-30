@@ -2019,6 +2019,73 @@ function tomtomProxy() {
  *
  * @returns {import('vite').Plugin}
  */
+function anaHidroProxy() {
+  return {
+    name: 'ana-hidro-proxy',
+    configureServer(server) {
+      let cachedAuth = null; // { token, obtainedAt }
+
+      async function getToken() {
+        const identificador = String(process.env.ANA_IDENTIFICADOR || '').trim();
+        const senha = String(process.env.ANA_SENHA || '').trim();
+        if (!identificador || !senha) throw new Error('ANA credentials not configured');
+
+        const TOKEN_LIFETIME_MS = 60 * 60_000;
+        const SAFETY_MARGIN_MS = 2 * 60_000;
+        if (cachedAuth && Date.now() - cachedAuth.obtainedAt < TOKEN_LIFETIME_MS - SAFETY_MARGIN_MS) {
+          return cachedAuth.token;
+        }
+
+        // Never log this URL or response — it embeds credentials/token.
+        const res = await fetch('https://www.ana.gov.br/hidrowebservice/EstacoesTelemetricas/OAUth/v1', {
+          headers: { Identificador: identificador, Senha: senha },
+        });
+        if (!res.ok) throw new Error(`ANA auth HTTP ${res.status}`);
+        const body = await res.json();
+        const token = body?.items?.tokenautenticacao;
+        if (body?.status !== 'OK' || !token) throw new Error('ANA auth failed');
+
+        cachedAuth = { token, obtainedAt: Date.now() };
+        return token;
+      }
+
+      server.middlewares.use('/api/ana-hidro', async (req, res) => {
+        try {
+          const url = new URL(req.url, 'http://localhost');
+          const codigoEstacao = url.searchParams.get('estacao') || '15400000';
+          const dataBusca = url.searchParams.get('data')
+            || new Date().toISOString().slice(0, 10);
+
+          const token = await getToken();
+
+          const apiUrl = 'https://www.ana.gov.br/hidrowebservice/EstacoesTelemetricas'
+            + '/HidroinfoanaSerieTelemetricaAdotada/v1'
+            + `?${encodeURIComponent('Código da Estação')}=${encodeURIComponent(codigoEstacao)}`
+            + `&${encodeURIComponent('Tipo Filtro Data')}=DATA_LEITURA`
+            + `&${encodeURIComponent('Data de Busca (yyyy-MM-dd)')}=${encodeURIComponent(dataBusca)}`
+            + `&${encodeURIComponent('Range Intervalo de busca')}=DIAS_30`;
+
+          const apiRes = await fetch(apiUrl, { headers: { Authorization: `Bearer ${token}` } });
+          const body = await apiRes.json().catch(() => null);
+
+          if (!apiRes.ok || !body || body.status !== 'OK' || !Array.isArray(body.items)) {
+            res.statusCode = 502;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'ana-hidro upstream failure' }));
+            return;
+          }
+
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ items: body.items }));
+        } catch (err) {
+          res.statusCode = err.message === 'ANA credentials not configured' ? 501 : 500;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: err.message }));
+        }
+      });
+    },
+  };
+}
 function firmsProxy() {
   const TTL_MS = 30 * 60_000;
   const STATUS_TTL_MS = 5 * 60_000;
@@ -7681,6 +7748,7 @@ export default defineConfig(({ mode }) => {
       celestrakProxy(),
       tomtomProxy(),
       firmsProxy(),
+      anaHidroProxy(),
       rocketLaunchesProxy(),
       terrainHeightsProxy(),
       adsbdbProxy(),
@@ -7729,7 +7797,7 @@ export default defineConfig(({ mode }) => {
     build: {
       // The Cesium engine bundle is inherently large; raise the warning ceiling
       // so the build log isn't dominated by an expected chunk-size notice.
-      chunkSizeWarningLimit: 1500,
+      chunkSizeWarningLimit: 3000,
     },
   };
 });
